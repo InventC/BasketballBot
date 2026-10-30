@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Hoops Bet Scout v1</title>
+<title>Hoops Bet Scout v1.5</title>
 <style>
 /* system fonts - no external dependency */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
@@ -154,7 +154,7 @@ details.more .line:last-child{border-bottom:none;}
     <div class="logo">&#127936;</div>
     <div>
       <span class="app-name">Hoops Bet Scout</span>
-      <span class="app-sub">// v1 &middot; NBA player points props &middot; Gemini + ESPN &middot; Free</span>
+      <span class="app-sub">// v1.5 &middot; NBA player points props &middot; Gemini + ESPN &middot; Free</span>
     </div>
   </div>
 </div>
@@ -257,7 +257,10 @@ var CFG = {
   MIN_GAMES: 6,            // history needed to model a player
   GAP_ABS: 6, GAP_REL: 0.28, // model-vs-line gap above which a line is "held back" (likely missed news)
   EARLY_GP: 3,             // fewer current-season games than this -> 3 star cap
-  CACHE_HOURS: 4
+  CACHE_HOURS: 4,
+  SO_URL: 'https://scoresandodds.com/nba/props',  // free public props page, read by Gemini (primary line source)
+  SECOND_PASS_PER_CALL: 12,  // players per targeted second-pass search call
+  ACTION_SHOW: 12            // action-line cards shown before the rest collapse
 };
 
 /* =====================================================================
@@ -325,7 +328,9 @@ var S = {
   blend:{},            // playerId -> {ppg,min,gp27,name}
   models:{},           // gameId -> {game, sides:[{team,opp,isHome,cands:[...]}]}
   defense:null, defenseNote:'',
-  lines:{},            // gameId -> {normName: lineInfo}
+  lines:{},            // gameId -> {normName: lineInfo}  (Google search results)
+  so:{}, soNote:'',    // props-page lines by normalized name
+  lastAction:[],
   chunk:null, results:null, running:false, lastCompute:null
 };
 
@@ -510,15 +515,35 @@ function simProbs(sim,L){
   var o=0,u=0,p=0; for(var i=0;i<sim.length;i++){ var x=sim[i]; if(x>L) o++; else if(x<L) u++; else p++; }
   var N=sim.length; return {over:o/N,under:u/N,push:p/N};
 }
-function pickBest(sim,line,overOdds,underOdds){
-  var pr=simProbs(sim,line), den=pr.over+pr.under;
-  if(den<=0) return null;
-  var winO=pr.over/den, winU=pr.under/den;
+function pickBest(sim,oL,uL,overOdds,underOdds){
+  var po=simProbs(sim,oL), pu=(uL===oL)?po:simProbs(sim,uL);
+  var dO=po.over+po.under, dU=pu.over+pu.under;
+  if(dO<=0||dU<=0) return null;
+  var winO=po.over/dO, winU=pu.under/dU;
   var eO=(winO-impliedProb(overOdds))*100, eU=(winU-impliedProb(underOdds))*100;
   var side=eO>=eU?'OVER':'UNDER';
   var win=side==='OVER'?winO:winU, odds=side==='OVER'?overOdds:underOdds, edge=side==='OVER'?eO:eU;
   var ev=win*payoutPerUnit(odds)-(1-win);
-  return {side:side,win:win,edge:edge,ev:ev,odds:odds,probs:pr};
+  return {side:side,win:win,edge:edge,ev:ev,odds:odds,line:side==='OVER'?oL:uL,probs:side==='OVER'?po:pu};
+}
+
+/* ====== action lines: what line would make this player a bet (no posted line needed) ====== */
+function actionLines(sim,caps,prof,cls){
+  var st=simStats(sim), be=impliedProb(-110), need=CFG.MIN_EDGE/100;
+  var over=null, under=null;
+  var k0=Math.max(0,Math.floor(st.p10)-8), k1=Math.ceil(st.p90)+8;
+  for(var k=k0;k<=k1;k++){
+    var L=k+0.5, pr=simProbs(sim,L);
+    if(pr.over-be>=need) over=L;                       // highest line that still clears the edge
+    if(under===null&&pr.under-be>=need) under=L;       // lowest line that clears the edge
+  }
+  var sd=prof.sdMin, bm=prof.baseMin, stab, ss;
+  if(bm>=28&&sd<=5.2&&prof.n>=20){ stab='High'; ss=3; }
+  else if(bm>=22&&sd<=6.5&&prof.n>=12){ stab='Medium'; ss=2; }
+  else { stab='Low'; ss=1; }
+  caps.forEach(function(cp){ if(cp.side==='both'&&cp.max<ss) ss=cp.max; });
+  if(cls==='questionable') ss=Math.min(ss,2);
+  return {over:over,under:under,stars:ss,stab:stab};
 }
 
 /* blended season numbers for ranking players */
@@ -573,13 +598,31 @@ function tiltPts(prof,projMin,oppName){
 }
 
 /* ====== lookup of Gemini line info for a player ====== */
-function lineFor(gameId,name,teamAbbr){
-  var g=S.lines[gameId]; if(!g) return null;
-  var k=normName(name); if(g[k]) return g[k];
-  var parts=k.split(' '), last=parts[parts.length-1], first=parts[0]||'';
-  var hit=null;
-  Object.keys(g).forEach(function(kk){ var p=kk.split(' '); if(p[p.length-1]===last&&(p[0]||'').charAt(0)===first.charAt(0)) hit=g[kk]; });
+var ABBR_ALIAS={GSW:'GS',NYK:'NY',SAS:'SA',NOP:'NO',WAS:'WSH',UTH:'UTAH',PHO:'PHX',BRK:'BKN',CHO:'CHA',NOR:'NO'};
+function abbrNorm(a){ a=String(a||'').toUpperCase().replace(/[^A-Z]/g,''); return ABBR_ALIAS[a]||a; }
+function fuzzyFind(map,k){
+  if(map[k]) return map[k];
+  var parts=k.split(' '), last=parts[parts.length-1], first=parts[0]||'', hit=null;
+  Object.keys(map).forEach(function(kk){ var p=kk.split(' '); if(p[p.length-1]===last&&(p[0]||'').charAt(0)===first.charAt(0)) hit=map[kk]; });
   return hit;
+}
+function soLookup(name,teamAbbr){
+  var hit=fuzzyFind(S.so||{},normName(name));
+  if(!hit) return null;
+  if(hit.team&&teamAbbr&&abbrNorm(hit.team)!==abbrNorm(teamAbbr)) return null; // wrong team = wrong player or stale row
+  return hit;
+}
+function lineFor(gameId,name,teamAbbr){
+  var g=S.lines[gameId], gs=g?fuzzyFind(g,normName(name)):null;
+  var so=soLookup(name,teamAbbr);
+  if(!so){
+    if(gs&&gs.line!==null&&gs.line!==undefined){ gs.src='search'; gs.overLine=gs.line; gs.underLine=gs.line; gs.overBook=gs.book; gs.underBook=gs.book; }
+    return gs;
+  }
+  return {name:so.name,line:so.overLine,overLine:so.overLine,underLine:so.underLine,overOdds:so.overOdds,underOdds:so.underOdds,
+          overBook:so.overBook,underBook:so.underBook,book:so.overBook||so.underBook,src:'so',
+          news:gs?gs.news:'none',note:(gs&&gs.note)?gs.note:'',
+          gsLine:(gs&&gs.line!==null&&gs.line!==undefined)?gs.line:null};
 }
 
 /* ====== evaluate one player ====== */
@@ -625,19 +668,21 @@ function evaluatePlayer(c,side,game){
   var res={c:c,side:side,game:game,prof:prof,flags:flags,caps:caps,mean:st.mean,median:st.median,p10:st.p10,p90:st.p90,
            projMin:projMin,tilt:tilt,tiltRaw:tl,usagePts:usagePts,minDelta:minDelta,env:env,oppMissing:om,sim:sim,
            news:news,li:li,line:null,best:null,stars:0,held:false,noLine:false};
-  if(!li||li.line===null||li.line===undefined){ res.noLine=true; return res; }
-  var line=li.line, oo=li.overOdds, uo=li.underOdds;
+  if(!li||li.line===null||li.line===undefined){ res.noLine=true; res.action=actionLines(sim,caps,prof,cls); return res; }
+  var oL=(li.overLine!==undefined&&li.overLine!==null)?li.overLine:li.line, uL=(li.underLine!==undefined&&li.underLine!==null)?li.underLine:li.line;
+  var line=(oL+uL)/2, oo=li.overOdds, uo=li.underOdds;
   if(oo===null&&uo!==null) oo=-110; if(uo===null&&oo!==null) uo=-110;
   var oddsAssumed=(li.overOdds===null&&li.underOdds===null);
-  res.line=line; res.overOdds=oo; res.underOdds=uo; res.oddsAssumed=oddsAssumed;
+  res.line=line; res.book=li.book||''; res.overOdds=oo; res.underOdds=uo; res.oddsAssumed=oddsAssumed;
+  if(li.gsLine!==null&&li.gsLine!==undefined&&Math.abs(li.gsLine-oL)>=1.5){ caps.push({max:3,why:'line sources disagree',side:'both'}); flags.push('Line sources disagree (search '+li.gsLine+' vs page '+oL+')'); }
   if(!li.book){ caps.push({max:3,why:'no book named',side:'both'}); flags.push('Book not named'); }
   var altSuspect=(oo!==null&&(oo<-140||oo>135))||(uo!==null&&(uo<-140||uo>135));
   if(altSuspect){ caps.push({max:3,why:'odds look like an alt line',side:'both'}); flags.push('Odds look off (alt line?)'); }
   var gap=Math.abs(st.mean-line);
   if(gap>Math.max(CFG.GAP_ABS,CFG.GAP_REL*line)){ res.held=true; res.gap=gap; return res; }
-  var best=pickBest(sim,line,oo,uo);
+  var best=pickBest(sim,oL,uL,oo,uo);
   if(!best) return res;
-  res.best=best;
+  res.best=best; res.line=best.line; res.book=best.side==='OVER'?(li.overBook||li.book||''):(li.underBook||li.book||'');
   var base=best.edge>=10?5:best.edge>=7.5?4:best.edge>=CFG.MIN_EDGE?3:0;
   var sideKey=best.side.toLowerCase(), stars=base, capWhy=null;
   caps.forEach(function(cp){ if(cp.side==='both'||cp.side===sideKey){ if(cp.max<stars){ stars=cp.max; capWhy=cp.why; } } });
@@ -661,7 +706,7 @@ function buildReason(r){
    COMPUTE + RENDER
    ===================================================================== */
 function computeAll(){
-  var all=[], held=[], noLine=[], excluded=[], flagged=[], analyzed=0;
+  var all=[], held=[], noLine=[], excluded=[], flagged=[], analyzed=0, srcSO=0, srcGS=0;
   Object.keys(S.models).forEach(function(gid){
     var gm=S.models[gid];
     gm.sides.forEach(function(side){
@@ -669,6 +714,7 @@ function computeAll(){
         var r=evaluatePlayer(c,side,gm.game);
         if(r.excluded){ excluded.push(r); return; }
         analyzed++; all.push(r);
+        if(r.li&&r.li.src==='so') srcSO++; else if(r.li&&r.li.line!==null&&r.li.line!==undefined) srcGS++;
         if(r.noLine) noLine.push(r); else if(r.held) held.push(r); else if(r.best&&r.stars>=3&&r.best.edge>=CFG.MIN_EDGE) flagged.push(r);
       });
     });
@@ -679,7 +725,7 @@ function computeAll(){
   var maxHigh=Math.max(1,Math.ceil(kept.length/2)), high=0;
   kept.forEach(function(r){ if(r.stars>=4){ high++; if(high>maxHigh){ r.stars=3; r.capWhy='volume rule'; } } });
   kept.sort(function(a,b){ return (b.stars-a.stars)||(b.best.edge-a.best.edge); });
-  return {all:all,flagged:kept,extra:dropped.length,held:held,noLine:noLine,excluded:excluded,analyzed:analyzed};
+  return {all:all,flagged:kept,extra:dropped.length,held:held,noLine:noLine,excluded:excluded,analyzed:analyzed,srcSO:srcSO,srcGS:srcGS};
 }
 
 function gameLabel(g){ return g.away.abbr+' @ '+g.home.abbr; }
@@ -694,18 +740,18 @@ function renderOutput(track){
   var out=$('output'), h='';
   var withLine=R.all.length-R.noLine.length;
   h+='<div class="cards-wrap">';
-  h+='<div class="sumline"><b>'+R.analyzed+'</b> players analyzed &middot; <b>'+R.flagged.length+'</b> flagged'+(R.extra?' (+'+R.extra+' more below the cap)':'')+' &middot; '+withLine+' with a posted line &middot; '+R.noLine.length+' without a line';
+  h+='<div class="sumline"><b>'+R.analyzed+'</b> players analyzed &middot; <b>'+R.flagged.length+'</b> flagged'+(R.extra?' (+'+R.extra+' more below the cap)':'')+' &middot; '+withLine+' with a posted line ('+R.srcSO+' from props page, '+R.srcGS+' from search) &middot; '+R.noLine.length+' without a line (see action lines)';
   if(R.held.length) h+=' &middot; <b>'+R.held.length+'</b> held back (model and line disagree sharply, likely missed news: '+R.held.slice(0,4).map(function(r){ return escH(r.c.name); }).join(', ')+(R.held.length>4?'...':'')+')';
   if(R.excluded.length) h+=' &middot; '+R.excluded.length+' excluded (out/resting)';
-  h+='<br>Matchup data: '+(S.defense?'<b>'+escH(S.defense.season)+'</b> opponent shooting table':'<b>not available</b> (confidence capped at 4 stars)')+' &middot; Min edge '+CFG.MIN_EDGE+'pp &middot; Max '+CFG.MAX_FLAGS+' flags &middot; Tracker imports '+CFG.TRACK_MIN_STARS+'+ stars</div>';
+  h+='<br>Matchup data: '+(S.defense?'<b>'+escH(S.defense.season)+'</b> opponent shooting table':'<b>not available</b> (confidence capped at 4 stars)')+' &middot; Props page: '+escH(S.soNote||'not read')+' &middot; Min edge '+CFG.MIN_EDGE+'pp &middot; Max '+CFG.MAX_FLAGS+' flags &middot; Tracker imports '+CFG.TRACK_MIN_STARS+'+ stars</div>';
 
   if(!R.flagged.length){
-    h+='<div class="empty" style="min-height:200px;"><div class="empty-txt">No flagged edges right now.'+(withLine===0?'<br>No prop lines were found for this slate yet. Try again later or hit Refresh Lines.':'<br>That is normal - most nights have only a few real edges.')+'</div></div>';
+    h+='<div class="empty" style="min-height:200px;"><div class="empty-txt">No flagged edges right now.'+(withLine===0?'<br>No prop lines were found for this slate yet. Check the action lines below, or try Refresh Lines later.':'<br>That is normal - most nights have only a few real edges.')+'</div></div>';
   } else {
     // best bet banner
     var bb=R.flagged[0];
     h+='<div class="game-card best"><div class="card-head"><div class="card-title">BEST BET OF THE DAY</div><div class="best-badge">&#9733; BEST BET</div></div><div class="card-body">';
-    h+='<div class="stat-grid"><div class="stat-row2 full-row"><div class="stat-key">Pick</div><div class="stat-val" style="font-weight:600;">'+escH(bb.c.name)+' ('+escH(bb.side.team.abbr)+') '+bb.best.side+' '+bb.line+' pts ('+fmtOdds(bb.best.odds)+(bb.li&&bb.li.book?', '+escH(bb.li.book):'')+')</div></div>';
+    h+='<div class="stat-grid"><div class="stat-row2 full-row"><div class="stat-key">Pick</div><div class="stat-val" style="font-weight:600;">'+escH(bb.c.name)+' ('+escH(bb.side.team.abbr)+') '+bb.best.side+' '+bb.line+' pts ('+fmtOdds(bb.best.odds)+(bb.book?', '+escH(bb.book):'')+')</div></div>';
     h+='<div class="stat-row2 full-row"><div class="stat-key">Reasoning</div><div class="stat-val">'+escH(buildReason(bb))+'</div></div></div>';
     h+='<div class="conf-row"><span style="color:var(--dim);">Confidence</span><span style="color:'+starColor(bb.stars)+';">'+starStr(bb.stars)+'</span><span>'+bb.stars+'/5</span></div></div></div>';
 
@@ -725,7 +771,7 @@ function renderOutput(track){
         var b=r.best, col=starColor(r.stars);
         h+='<div class="rec" style="border-left-color:'+col+';">';
         h+='<div class="rec-top"><div class="rec-type" style="color:'+col+';">PTS PROP &mdash; '+escH(r.c.name)+' ('+escH(r.side.team.abbr)+')</div><div style="font-family:var(--mono);font-size:10px;color:'+col+';">'+starStr(r.stars)+' '+r.stars+'/5</div></div>';
-        h+='<div class="rec-body"><b>'+b.side+' '+r.line+'</b> ('+fmtOdds(b.odds)+(r.li&&r.li.book?', '+escH(r.li.book):'')+') &middot; proj '+fmt1(r.mean)+' (med '+r.median+') &middot; P('+b.side.toLowerCase()+') '+pct0(b.win)+' &middot; edge '+signed(b.edge)+'pp &middot; EV '+signed(b.ev,2)+'u</div>';
+        h+='<div class="rec-body"><b>'+b.side+' '+r.line+'</b> ('+fmtOdds(b.odds)+(r.book?', '+escH(r.book):'')+') &middot; proj '+fmt1(r.mean)+' (med '+r.median+') &middot; P('+b.side.toLowerCase()+') '+pct0(b.win)+' &middot; edge '+signed(b.edge)+'pp &middot; EV '+signed(b.ev,2)+'u</div>';
         h+='<div class="rec-note">'+escH(buildReason(r))+(r.li&&r.li.note?' Note: '+escH(r.li.note):'')+'</div>';
         var fl=r.flags.slice(); if(r.capWhy) fl.push('Capped: '+r.capWhy); if(r.oddsAssumed) fl.push('Odds assumed -110');
         if(fl.length){ h+='<div>'; fl.forEach(function(f){ h+='<span class="flag">'+escH(f)+'</span>'; }); h+='</div>'; }
@@ -736,12 +782,33 @@ function renderOutput(track){
     });
   }
 
-  // fair lines without a posted line (collapsed)
+  // action lines for players with no posted line
   if(R.noLine.length){
-    var nl=R.noLine.slice().sort(function(a,b){ return b.mean-a.mean; });
-    h+='<details class="more"><summary>Projections without a posted line ('+nl.length+')</summary><div style="margin-top:8px;">';
-    nl.forEach(function(r){ h+='<div class="line">'+escH(r.c.name)+' ('+escH(r.side.team.abbr)+' '+(r.side.isHome?'vs ':'@ ')+escH(r.side.opp.abbr)+'): proj '+fmt1(r.mean)+' pts, median '+r.median+', fair line ~'+(Math.round(r.median*2)/2).toFixed(1)+' on '+fmt1(r.projMin)+' min'+(r.flags.length?' &middot; '+escH(r.flags.join(', ')):'')+'</div>'; });
-    h+='</div></details>';
+    var nl=R.noLine.filter(function(r){ return r.action; }).sort(function(a,b){ return (b.action.stars-a.action.stars)||(b.prof.baseMin-a.prof.baseMin); });
+    S.lastAction=nl;
+    var actCard=function(r,i){
+      var a=r.action, col=starColor(a.stars), parts=[];
+      parts.push(a.over!==null?'<b style="color:var(--green)">OVER</b> if line &le; '+a.over.toFixed(1):'no OVER at a sensible line');
+      parts.push(a.under!==null?'<b style="color:var(--blue)">UNDER</b> if line &ge; '+a.under.toFixed(1):'no UNDER at a sensible line');
+      var c='<div class="rec" style="border-left-color:'+col+';">';
+      c+='<div class="rec-top"><div class="rec-type" style="color:'+col+';">'+escH(r.c.name)+' ('+escH(r.side.team.abbr)+' '+(r.side.isHome?'vs ':'@ ')+escH(r.side.opp.abbr)+')</div><div style="font-family:var(--mono);font-size:10px;color:'+col+';">'+starStr(a.stars)+' '+a.stars+'/5 &middot; '+a.stab+' role</div></div>';
+      c+='<div class="rec-body">'+parts.join(' &middot; ')+' &middot; <span style="color:var(--muted)">pass in between</span></div>';
+      c+='<div class="rec-note">Proj '+fmt1(r.mean)+' pts (median '+r.median+', 10-90%: '+r.p10+'-'+r.p90+') on '+fmt1(r.projMin)+' min &middot; fair line ~'+(Math.round(r.median*2)/2).toFixed(1)+'. Thresholds assume -110 odds.</div>';
+      if(r.flags.length){ c+='<div>'; r.flags.forEach(function(f){ c+='<span class="flag">'+escH(f)+'</span>'; }); c+='</div>'; }
+      c+='<div style="display:flex;gap:6px;flex-wrap:wrap;">';
+      if(a.over!==null) c+='<button class="mini-btn" onclick="trackAction('+i+',\'OVER\')">+ TRACK OVER</button>';
+      if(a.under!==null) c+='<button class="mini-btn" onclick="trackAction('+i+',\'UNDER\')">+ TRACK UNDER</button>';
+      return c+'</div></div>';
+    };
+    h+='<div class="game-card"><div class="card-head"><div class="card-title">ACTION LINES &mdash; no posted line found<div class="card-sub">Look up the line at your book. Bet only if it clears the threshold. Ranked by how stable the player\'s minutes and role are.</div></div></div><div class="card-body"><div class="recs-list">';
+    nl.slice(0,CFG.ACTION_SHOW).forEach(function(r,i){ h+=actCard(r,i); });
+    h+='</div>';
+    if(nl.length>CFG.ACTION_SHOW){
+      h+='<details class="more"><summary>'+(nl.length-CFG.ACTION_SHOW)+' more action lines</summary><div class="recs-list" style="margin-top:8px;">';
+      nl.slice(CFG.ACTION_SHOW).forEach(function(r,j){ h+=actCard(r,j+CFG.ACTION_SHOW); });
+      h+='</div></details>';
+    }
+    h+='</div></div>';
   }
   h+='</div>';
   out.innerHTML=h;
@@ -753,6 +820,22 @@ function trackPick(i){
   var R=S.lastCompute; if(!R||!R.flagged[i]) return;
   var n=importPicks([R.flagged[i]],true);
   setStatus(n?'Pick added to tracker.':'Already in tracker.',false);
+}
+
+function trackAction(i,side){
+  var r=(S.lastAction||[])[i]; if(!r||!r.action) return;
+  var thr=side==='OVER'?r.action.over:r.action.under; if(thr===null||thr===undefined) return;
+  var ans=prompt('What line did you get at your book for '+r.c.name+' ('+side+')?\nBet only if it is '+(side==='OVER'?'at or below ':'at or above ')+thr.toFixed(1)+'. Odds are assumed -110.',thr.toFixed(1));
+  if(ans===null) return;
+  var line=num(ans); if(line===null||line<1||line>60){ setStatus('Not tracked - that is not a valid line.',false); return; }
+  var pr=simProbs(r.sim,line), den=pr.over+pr.under, win=den>0?(side==='OVER'?pr.over:pr.under)/den:0.5;
+  var edge=(win-impliedProb(-110))*100;
+  if(edge<CFG.MIN_EDGE&&!confirm('That line is past the threshold (edge '+signed(edge)+'pp). Track it anyway?')) return;
+  var bets=loadBets();
+  if(bets.some(function(b){ return b.date===S.date&&b.player===r.c.name&&b.side===side; })){ setStatus('Already in tracker.',false); return; }
+  bets.push({id:Date.now()+Math.random(),date:S.date,game:gameLabel(r.game),player:r.c.name,team:r.side.team.abbr,side:side,line:line,
+             odds:-110,book:'',pick:side+' '+line+' PTS',conf:r.action.stars,proj:Math.round(r.mean*10)/10,median:r.median,edge:Math.round(edge*10)/10,result:'P',src:'action'});
+  saveBets(bets); updateTrackerBadge(); setStatus('Action line added to tracker.',false);
 }
 
 /* =====================================================================
@@ -842,8 +925,47 @@ async function getDefense(force){
   cacheSet(key,d); S.defenseNote='fresh via '+r.model; return d;
 }
 
+/* ---- props page (ScoresAndOdds) via URL context: primary line source ---- */
+function validateSO(arr){
+  var map={}, n=0;
+  (arr||[]).forEach(function(p){
+    if(!p||!p.name) return;
+    if(p.stat&&!/point|pts/i.test(String(p.stat))) return;           // points only
+    var oL=num(p.overLine!==undefined?p.overLine:p.line), uL=num(p.underLine!==undefined?p.underLine:p.line);
+    if(oL===null&&uL===null) return; if(oL===null) oL=uL; if(uL===null) uL=oL;
+    if(oL<3||oL>55||uL<3||uL>55||Math.abs(oL-uL)>2) return;          // implausible or mismatched
+    map[normName(p.name)]={name:String(p.name),team:p.team?String(p.team):'',overLine:oL,underLine:uL,overOdds:parseOdds(p.overOdds),underOdds:parseOdds(p.underOdds),
+      overBook:p.overBook?String(p.overBook):null,underBook:p.underBook?String(p.underBook):null};
+    n++;
+  });
+  return {map:map,n:n};
+}
+function salvagePlayers(text){ // recover complete player objects from a truncated JSON reply
+  var out=[], re=/\{[^{}]*\}/g, m;
+  while((m=re.exec(text||''))){ try{ var o=JSON.parse(m[0]); if(o&&o.name) out.push(o); }catch(e){} }
+  return out;
+}
+async function getPropsPage(force){
+  var key='hbs_so_'+S.date;
+  if(!force){
+    var c=cacheGet(key); if(c){ S.soNote='cached ('+Object.keys(c).length+' lines)'; return c; }
+    var ne=lsGet('hbs_so_empty_'+S.date,0); if(ne&&Date.now()-ne<20*60000){ S.soNote='page had no points lines '+Math.max(1,Math.round((Date.now()-ne)/60000))+' min ago (re-checks after 20 min or on Refresh Lines)'; return {}; }
+  }
+  var prompt='Read this page: '+CFG.SO_URL+'\n'+
+    'It lists NBA player prop lines from several sportsbooks. Extract ONLY the player POINTS props for the games listed (ignore rebounds, assists, threes, combined stats and every other stat). '+
+    'For each player return the best OVER line, odds and sportsbook, and the best UNDER line, odds and sportsbook, exactly as the page shows them (the over and under can come from different books and can have different lines). Include the team abbreviation.\n'+
+    'If the page has no player points lines (for example it says props are not available yet), return {"players":[]}. Do not guess or fill in numbers you cannot see on the page.\n'+
+    'Return ONLY one JSON object, no markdown, in exactly this shape: {"players":[{"name":"Full Name","team":"MEM","stat":"points","overLine":23.5,"overOdds":-115,"overBook":"BetMGM","underLine":24.5,"underOdds":-119,"underBook":"DraftKings"}]}';
+  var r=await geminiCall(CFG.SEARCH_MODELS,prompt,{urlContext:true,maxTokens:16000,temp:0});
+  var obj=extractObject(r.text), arr=(obj&&Array.isArray(obj.players))?obj.players:salvagePlayers(r.text);
+  var v=validateSO(arr);
+  if(v.n>0){ cacheSet(key,v.map); lsSet('hbs_so_empty_'+S.date,0); } else lsSet('hbs_so_empty_'+S.date,Date.now());
+  S.soNote=v.n+' points lines read via '+r.model;
+  return v.map;
+}
+
 /* ---- prop lines + news via Google Search ---- */
-function buildLinePrompt(chunk){
+function buildLinePrompt(chunk,strict){
   var lines=[];
   chunk.forEach(function(it,gi){
     var g=it.game;
@@ -852,6 +974,7 @@ function buildLinePrompt(chunk){
   });
   return 'You are an NBA props research assistant. Today is '+S.date+'. Use Google Search to find the CURRENT player POINTS prop lines (over/under) for tonight\'s games and any late-breaking availability news.\n\n'+
     lines.join('\n')+'\n\n'+
+    (strict?'NOTE: a first pass could not find a points line for these players. Search each player by name (for example "<name> points prop line") and check sportsbook and prop-aggregator pages (DraftKings, FanDuel, BetMGM, Caesars, ScoresAndOdds, Covers, Action Network, OddsShark). Report a line only if you actually see one for tonight\'s game.\n\n':'')+
     'RULES:\n'+
     '- Only the standard main points line (over/under priced near -110 each side). Never an alternate or "X+" ladder line.\n'+
     '- Prefer DraftKings, FanDuel, BetMGM, Caesars or ESPN BET. Name the sportsbook for every line.\n'+
@@ -870,23 +993,29 @@ function mapLines(chunk,obj){
       if(!p||!p.name) return;
       var line=num(p.line); if(line!==null&&(line<3||line>52)) line=null;
       var news=String(p.news||'none').toLowerCase().replace(/[^a-z_]/g,''); if(['none','questionable','doubtful','out','resting','minutes_restriction','role_change'].indexOf(news)<0) news='none';
-      S.lines[it.game.id][normName(p.name)]={name:p.name,line:line,overOdds:parseOdds(p.overOdds),underOdds:parseOdds(p.underOdds),book:p.book?String(p.book):null,news:news,note:p.note?String(p.note).slice(0,140):''};
+      var nk=normName(p.name), rec={name:p.name,line:line,overOdds:parseOdds(p.overOdds),underOdds:parseOdds(p.underOdds),book:p.book?String(p.book):null,news:news,note:p.note?String(p.note).slice(0,140):''};
+      var prev=S.lines[it.game.id][nk];
+      if(prev){
+        if(rec.line===null&&prev.line!==null&&prev.line!==undefined){ rec.line=prev.line; rec.overOdds=prev.overOdds; rec.underOdds=prev.underOdds; rec.book=prev.book; }
+        if(rec.news==='none'&&prev.news&&prev.news!=='none'){ rec.news=prev.news; rec.note=prev.note||rec.note; }
+      }
+      S.lines[it.game.id][nk]=rec;
       if(line!==null) n++;
     });
   });
   return n;
 }
-async function runLineChunk(chunk,force){
-  var key='hbs_lines_'+S.date+'_'+hashSeed(chunk.map(function(it){ return it.game.id+':'+it.players.map(function(p){return p.id;}).join(','); }).join('|'));
-  if(!force){ var c=cacheGet(key); if(c){ mapLines(chunk,c); return 'cache'; } }
-  var r=await geminiCall(CFG.SEARCH_MODELS,buildLinePrompt(chunk),{search:true,maxTokens:8192,temp:0.1});
+async function runLineChunk(chunk,force,strict){
+  var key='hbs_lines'+(strict?'2':'')+'_'+S.date+'_'+hashSeed(chunk.map(function(it){ return it.game.id+':'+it.players.map(function(p){return p.id;}).join(','); }).join('|'));
+  if(!force&&!strict){ var c=cacheGet(key); if(c){ mapLines(chunk,c); return 'cache'; } }
+  var r=await geminiCall(CFG.SEARCH_MODELS,buildLinePrompt(chunk,strict),{search:true,maxTokens:8192,temp:0.1});
   var obj=extractObject(r.text);
   if(!obj||!obj.games){
     var fix=await geminiCall([CFG.PARSE_MODEL],'Convert the text below into ONE JSON object of this exact shape and return only the JSON: {"games":[{"game":1,"players":[{"name":"","line":null,"overOdds":null,"underOdds":null,"book":null,"news":"none","note":""}]}]}. Do not add information that is not in the text; use null when missing.\n\nTEXT:\n'+r.text,{maxTokens:4096,temp:0});
     obj=extractObject(fix.text);
   }
   if(!obj||!obj.games) throw new Error('Could not parse Gemini response for this chunk.');
-  mapLines(chunk,obj); cacheSet(key,obj); return r.model;
+  mapLines(chunk,obj); if(strict) persistSecond(chunk); else cacheSet(key,obj); return r.model;
 }
 
 /* =====================================================================
@@ -1027,6 +1156,63 @@ function buildChunks(){
   return chunks;
 }
 
+function secondKeys(){ return {f:'hbs_found2_'+S.date, t:'hbs_tried2_'+S.date}; }
+function persistSecond(chunk){
+  var k=secondKeys(), found=lsGet(k.f,{}), tried=lsGet(k.t,{});
+  chunk.forEach(function(it){
+    var gid=it.game.id; found[gid]=found[gid]||{};
+    it.players.forEach(function(p){
+      tried[p.id]=Date.now();
+      var nk=normName(p.name), rec=(S.lines[gid]||{})[nk];
+      if(rec&&rec.line!==null&&rec.line!==undefined) found[gid][nk]=rec;
+    });
+  });
+  lsSet(k.f,found); lsSet(k.t,tried);
+}
+function replaySecond(){
+  var found=lsGet(secondKeys().f,{});
+  Object.keys(found).forEach(function(gid){
+    S.lines[gid]=S.lines[gid]||{};
+    Object.keys(found[gid]).forEach(function(nk){
+      var cur=S.lines[gid][nk];
+      if(!cur||cur.line===null||cur.line===undefined){
+        var rec=found[gid][nk]; if(cur&&cur.news&&cur.news!=='none'){ rec.news=cur.news; rec.note=cur.note||rec.note; }
+        S.lines[gid][nk]=rec;
+      }
+    });
+  });
+}
+function resetSecond(){ var k=secondKeys(); lsSet(k.f,{}); lsSet(k.t,{}); }
+function triedRecently(id){ var t=lsGet(secondKeys().t,{})[id]; return !!t&&(Date.now()-t)<CFG.CACHE_HOURS*3600000; }
+
+async function runSecondPass(force){
+  var items=[];
+  Object.keys(S.models).forEach(function(gid){
+    var gm=S.models[gid], players=[];
+    gm.sides.forEach(function(side){
+      selectTop(side).forEach(function(c){
+        var li=lineFor(gm.game.id,c.name,side.team.abbr);
+        if(li&&(li.news==='out'||li.news==='doubtful'||li.news==='resting')) return;
+        if(li&&li.line!==null&&li.line!==undefined) return;
+        if(!force&&triedRecently(c.id)) return;   // already searched for this player recently
+        var inj=S.injuries.byId[c.id];
+        players.push({id:c.id,name:c.name,team:side.team.abbr,status:inj?inj.status+(inj.comment?' - '+inj.comment.slice(0,60):''):'Active'});
+      });
+    });
+    if(players.length) items.push({game:gm.game,players:players});
+  });
+  if(!items.length) return;
+  var calls=[], cur=[], n=0;
+  items.forEach(function(it){ if(n+it.players.length>CFG.SECOND_PASS_PER_CALL&&cur.length){ calls.push(cur); cur=[]; n=0; } cur.push(it); n+=it.players.length; });
+  if(cur.length) calls.push(cur);
+  calls=calls.slice(0,2);
+  for(var i=0;i<calls.length;i++){
+    setStatus('Second pass - searching again for players with no line ('+(i+1)+' of '+calls.length+')...',true);
+    await runLineChunk(calls[i],force,true);
+    if(i<calls.length-1) await sleep(2500);
+  }
+}
+
 function showResume(label){
   var cb=$('chunkBtn'); cb.style.display='block'; cb.disabled=false; cb.innerHTML='&#9654; '+label;
   var cp=$('chunkProgress'); cp.style.display='block';
@@ -1043,9 +1229,12 @@ async function startAnalysis(force){
     await prepareModels();
     setStatus('Reading opponent shooting table...',true);
     try{ S.defense=await getDefense(false); }catch(e){ S.defense=null; S.defenseNote=e.message; }
+    setStatus('Reading props page for lines...',true);
+    try{ S.so=await getPropsPage(force); }catch(e){ S.so={}; S.soNote='not read ('+e.message.slice(0,90)+')'; }
     var chunks=buildChunks();
     S.chunk={list:chunks,idx:0,force:!!force};
     S.lines=force?{}:S.lines;
+    if(force) resetSecond(); else replaySecond();
     renderOutput(false);
     await runChunks();
   }catch(e){
@@ -1070,6 +1259,7 @@ async function runChunks(){
     s.idx++; renderOutput(false);
     if(s.idx<s.list.length) await sleep(2500);
   }
+  if(!s.passDone){ try{ await runSecondPass(s.force); }catch(e){ S.soNote=(S.soNote||'')+' | second pass failed: '+e.message.slice(0,80); } s.passDone=true; }
   var R=renderOutput(true);
   stopTimer(); S.running=false; unlockUI(); hideResume();
   var added=S.lastAdded||0;
@@ -1098,7 +1288,7 @@ async function updateInjuries(){
 async function checkSources(){
   if(S.running) return;
   var out=$('output'); var rows=[];
-  function draw(){ out.innerHTML='<div class="cards-wrap"><div class="sumline">Source check - tests each free source live from this page. The Gemini tests use about 3 requests of your free quota.</div>'+rows.join('')+'</div>'; }
+  function draw(){ out.innerHTML='<div class="cards-wrap"><div class="sumline">Source check - tests each free source live from this page. The Gemini tests use about 4 requests of your free quota.</div>'+rows.join('')+'</div>'; }
   function ok(t,d){ rows.push('<div class="chk"><span class="ok">PASS</span><div><b>'+escH(t)+'</b><br><span style="color:var(--muted)">'+escH(d)+'</span></div></div>'); draw(); }
   function no(t,d){ rows.push('<div class="chk"><span class="no">FAIL</span><div><b>'+escH(t)+'</b><br><span style="color:var(--muted)">'+escH(d)+'</span></div></div>'); draw(); }
   $('checkBtn').disabled=true; setStatus('Checking sources...',true); draw();
@@ -1123,6 +1313,11 @@ async function checkSources(){
       var df=await getDefense(true);
       ok('Gemini page reading (Basketball-Reference opponent table)','Read '+df.n+' teams, season '+df.season+'. Matchup tilt is ON.');
     }catch(e){ no('Gemini page reading (Basketball-Reference opponent table)',e.message.slice(0,200)+' - matchup tilt will be OFF and confidence capped at 4 stars.'); }
+    try{
+      var pm=await getPropsPage(true), pn=Object.keys(pm).length;
+      if(pn>0) ok('Gemini page reading (ScoresAndOdds props page)','Read '+pn+' player points lines. This is the primary line source.');
+      else no('Gemini page reading (ScoresAndOdds props page)','The page was read but listed no points lines - props may not be posted yet. The bot falls back to Google search plus action lines.');
+    }catch(e){ no('Gemini page reading (ScoresAndOdds props page)',e.message.slice(0,200)+' - the bot falls back to Google search plus action lines.'); }
   }
   $('checkBtn').disabled=false; setStatus('Source check finished.',false);
 }
@@ -1140,7 +1335,7 @@ function importPicks(list,manual){
     var dup=bets.some(function(b){ return b.date===S.date&&b.player===r.c.name&&b.side===r.best.side; });
     if(dup) return;
     bets.push({id:Date.now()+Math.random(),date:S.date,game:gameLabel(r.game),player:r.c.name,team:r.side.team.abbr,side:r.best.side,line:r.line,
-               odds:r.best.odds,book:(r.li&&r.li.book)||'',pick:r.best.side+' '+r.line+' PTS',conf:r.stars,proj:Math.round(r.mean*10)/10,median:r.median,edge:Math.round(r.best.edge*10)/10,result:'P'});
+               odds:r.best.odds,book:r.book||'',src:'line',pick:r.best.side+' '+r.line+' PTS',conf:r.stars,proj:Math.round(r.mean*10)/10,median:r.median,edge:Math.round(r.best.edge*10)/10,result:'P'});
     added++;
   });
   saveBets(bets); updateTrackerBadge(); return added;
@@ -1169,7 +1364,7 @@ function renderTracker(){
     h+='<td style="font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap;">'+escH(b.date)+'</td>';
     h+='<td style="font-size:12px;">'+escH(b.game)+'</td>';
     h+='<td style="font-size:12px;">'+escH(b.player)+' <span class="type-badge">'+escH(b.team)+'</span></td>';
-    h+='<td style="font-size:12px;">'+(ip?'<span class="pending-dot"></span>':'')+escH(b.pick)+'</td>';
+    h+='<td style="font-size:12px;">'+(ip?'<span class="pending-dot"></span>':'')+escH(b.pick)+(b.src==='action'?' <span class="type-badge">ACTION</span>':'')+'</td>';
     h+='<td style="font-family:var(--mono);font-size:11px;">'+escH(fmtOdds(b.odds))+'</td>';
     h+='<td><span class="conf-badge c'+b.conf+'">'+b.conf+'/5</span></td>';
     h+='<td style="font-family:var(--mono);font-size:11px;color:var(--muted);">'+escH(b.proj)+'</td>';
@@ -1189,11 +1384,11 @@ function updateSummaryStats(bets){
   var uel=$('ts-units'); uel.textContent=(units>=0?'+':'')+units.toFixed(2); uel.style.color=units>=0?'var(--green)':'var(--red)';
 }
 function renderPerfGrid(bets){
-  var conf={}, side={}, dates={};
+  var conf={}, side={}, dates={}, src={};
   bets.forEach(function(b){
     if(b.result!=='W'&&b.result!=='L') return;
     function add(m,k){ if(!m[k]) m[k]={w:0,l:0,u:0}; if(b.result==='W') m[k].w++; else m[k].l++; m[k].u+=unitsFor(b); }
-    add(conf,b.conf); add(side,b.side); add(dates,b.date);
+    add(conf,b.conf); add(side,b.side); add(dates,b.date); add(src,b.src==='action'?'Action lines':'Posted lines');
   });
   function card(title,keys,label,m){
     if(!keys.length) return '';
@@ -1208,6 +1403,7 @@ function renderPerfGrid(bets){
   var h='';
   h+=card('By Confidence',Object.keys(conf).sort(function(a,b){return b-a;}),function(c){ return '<span style="color:var(--amber);font-family:var(--mono);font-size:11px;">'+starStr(parseInt(c,10))+'</span>'; },conf);
   h+=card('By Side',Object.keys(side),function(k){ return escH(k); },side);
+  h+=card('By Source',Object.keys(src),function(k){ return escH(k); },src);
   h+=card('By Date (Recent)',Object.keys(dates).sort().reverse().slice(0,7),function(k){ return escH(k); },dates);
   $('perfGrid').innerHTML=h;
 }
@@ -1218,7 +1414,7 @@ function renderPerfGrid(bets){
 (function init(){
   var k=lsGet('hbs_key',null); if(k){ $('apiKey').value=k; }
   onKeyInput(); updateTrackerBadge();
-  $('rulesBox').innerHTML='Min edge: '+CFG.MIN_EDGE+' pp<br>Max flags: '+CFG.MAX_FLAGS+'<br>Players per team: top '+CFG.PLAYERS_PER_TEAM+'<br>Tracked at: '+CFG.TRACK_MIN_STARS+'+ stars<br>Early-season cap: 3 stars under '+CFG.EARLY_GP+' games<br>Matchup tilt cap: &plusmn;'+Math.round(CFG.TILT_CAP*100)+'%<br>Gemini calls per run: ~1 + games/'+CFG.GAMES_PER_CALL;
+  $('rulesBox').innerHTML='Min edge: '+CFG.MIN_EDGE+' pp<br>Max flags: '+CFG.MAX_FLAGS+'<br>Players per team: top '+CFG.PLAYERS_PER_TEAM+'<br>Tracked at: '+CFG.TRACK_MIN_STARS+'+ stars<br>Early-season cap: 3 stars under '+CFG.EARLY_GP+' games<br>Matchup tilt cap: &plusmn;'+Math.round(CFG.TILT_CAP*100)+'%<br>Lines: props page, then search, then action lines<br>Gemini calls per run: ~2 + games/'+CFG.GAMES_PER_CALL+' (+1-2 second pass)';
 })();
 </script>
 </body>
