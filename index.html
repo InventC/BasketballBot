@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Hoops Bet Scout v1.7</title>
+<title>Hoops Bet Scout v2.0</title>
 <style>
 /* system fonts - no external dependency */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
@@ -154,7 +154,7 @@ details.more .line:last-child{border-bottom:none;}
     <div class="logo">&#127936;</div>
     <div>
       <span class="app-name">Hoops Bet Scout</span>
-      <span class="app-sub">// v1.7 &middot; NBA player points props &middot; Gemini + ESPN &middot; Free</span>
+      <span class="app-sub">// v2.0 &middot; NBA player points props &middot; Gemini + ESPN &middot; Free</span>
     </div>
   </div>
 </div>
@@ -246,9 +246,17 @@ var CFG = {
   PARSE_MODEL: 'gemini-2.5-flash-lite',                          // no-search JSON repair fallback
   GAMES_PER_CALL: 2,       // games per Gemini search call (fewer calls = less free-tier quota)
   PLAYERS_PER_TEAM: 4,
-  CAND_PER_TEAM: 6,        // profiled per team so injuries can swap players without new ESPN pulls
-  MIN_EDGE: 5,             // percentage points over break-even
-  MAX_FLAGS: 6,
+  DEPTH_PER_TEAM: 2,       // extra players ranked next on each team, analyzed only when a posted line already exists (no extra Gemini calls)
+  CAND_PER_TEAM: 8,        // profiled per team so injuries can swap players without new ESPN pulls
+  MIN_EDGE: 3,             // pp over break-even AFTER blending the model with the market (about 5pp on the old raw scale)
+  STAR4_EDGE: 4.5, STAR5_EDGE: 6.5,
+  MODEL_WEIGHT: 0.65,      // share of the model in the blended win probability (rest = de-vigged market)
+  ACTION_EDGE: 5,          // raw-model edge used for action lines (no market to blend with)
+  ALT_LINES: true, ALT_RANGE: 3, ALT_EXTRA_EDGE: 1, ALT_EV_MARGIN: 0.03,   // alternate-line shopping from ESPN's ladder
+  GAP_HARD_ABS: 8.5, GAP_HARD_REL: 0.36,   // beyond this the player is held back; between GAP_ABS/REL and this he is shown capped at 3 stars
+  RETURN_DAYS: 12,         // days since last game that count as returning from an absence
+  MAX_HIGH_SHARE: 1,       // share of flags allowed at 4+ stars (1 = no limit)
+  MAX_FLAGS: 999,          // no cap on the number of picks
   TRACK_MIN_STARS: 4,      // auto-imported to tracker
   TILT_CAP: 0.08,          // max matchup adjustment as share of projected mean
   TILT_SHRINK: 0.5,
@@ -491,7 +499,9 @@ function makeProfile(games,curSeason){
     sw+=w; sMin+=w*g.min; sPts+=w*g.pts; sFga+=w*g.fga; sTpa+=w*g.tpa; sFta+=w*g.fta;
     swm+=wm; sMinW+=wm*g.min;
   });
-  var ppm=(sPts+60*0.5)/(sMin+60);
+  var tp=0,tm=0; games.forEach(function(g){ tp+=g.pts; tm+=g.min; });
+  var prior=(tp+0.5*300)/(tm+300);                 // player's own multi-season rate, lightly pulled to the league norm
+  var ppm=(sPts+60*prior)/(sMin+60);
   var baseMin=sMinW/swm;
   var vm=0; games.forEach(function(g,i){ var wm=Math.pow(0.5,i/HLm); vm+=wm*Math.pow(g.min-baseMin,2); });
   var sdMin=clamp(Math.sqrt(vm/swm)*0.9,3.2,7.5);
@@ -499,7 +509,7 @@ function makeProfile(games,curSeason){
   var sigmaUnit=clamp(Math.sqrt((vr+6*1.15*1.15)/(sw+6)),0.9,1.7);
   var curGP=games.filter(function(g){ return g.season===curSeason; }).length;
   return {n:n,curGP:curGP,ppm:ppm,baseMin:baseMin,sdMin:sdMin,sigmaUnit:sigmaUnit,
-          fgaPm:sFga/sMin,tpaPm:sTpa/sMin,ftaPm:sFta/sMin,lastT:games[0].t,
+          fgaPm:sFga/sMin,tpaPm:sTpa/sMin,ftaPm:sFta/sMin,lastT:games[0].t,lastCur:games[0].season===curSeason,
           avgPts:sPts/sw,avgMin:sMin/sw};
 }
 
@@ -524,21 +534,24 @@ function simProbs(sim,L){
   var o=0,u=0,p=0; for(var i=0;i<sim.length;i++){ var x=sim[i]; if(x>L) o++; else if(x<L) u++; else p++; }
   var N=sim.length; return {over:o/N,under:u/N,push:p/N};
 }
-function pickBest(sim,oL,uL,overOdds,underOdds){
+function pickBest(sim,oL,uL,overOdds,underOdds,known){
   var po=simProbs(sim,oL), pu=(uL===oL)?po:simProbs(sim,uL);
   var dO=po.over+po.under, dU=pu.over+pu.under;
   if(dO<=0||dU<=0) return null;
   var winO=po.over/dO, winU=pu.under/dU;
-  var eO=(winO-impliedProb(overOdds))*100, eU=(winU-impliedProb(underOdds))*100;
+  var mO=0.5;                                       // market's fair P(over): de-vigged prices, or 50% when the prices are only assumed
+  if(known&&oL===uL){ var io=impliedProb(overOdds), iu=impliedProb(underOdds); mO=io/(io+iu); }
+  var W=CFG.MODEL_WEIGHT, bO=W*winO+(1-W)*mO, bU=W*winU+(1-W)*(1-mO);
+  var eO=(bO-impliedProb(overOdds))*100, eU=(bU-impliedProb(underOdds))*100;
   var side=eO>=eU?'OVER':'UNDER';
-  var win=side==='OVER'?winO:winU, odds=side==='OVER'?overOdds:underOdds, edge=side==='OVER'?eO:eU;
+  var win=side==='OVER'?bO:bU, odds=side==='OVER'?overOdds:underOdds, edge=side==='OVER'?eO:eU;
   var ev=win*payoutPerUnit(odds)-(1-win);
-  return {side:side,win:win,edge:edge,ev:ev,odds:odds,line:side==='OVER'?oL:uL,probs:side==='OVER'?po:pu};
+  return {side:side,win:win,modelWin:side==='OVER'?winO:winU,mktWin:side==='OVER'?mO:1-mO,edge:edge,ev:ev,odds:odds,line:side==='OVER'?oL:uL,probs:side==='OVER'?po:pu};
 }
 
 /* ====== action lines: what line would make this player a bet (no posted line needed) ====== */
 function actionLines(sim,caps,prof,cls){
-  var st=simStats(sim), be=impliedProb(-110), need=CFG.MIN_EDGE/100;
+  var st=simStats(sim), be=impliedProb(-110), need=CFG.ACTION_EDGE/100;
   var over=null, under=null;
   var k0=Math.max(0,Math.floor(st.p10)-8), k1=Math.ceil(st.p90)+8;
   for(var k=k0;k<=k1;k++){
@@ -589,10 +602,15 @@ function oppMissing(teamId){
   return names;
 }
 
-function selectTop(side){
+function selectTop(side,coreOnly){
   var ctx=teamContext(side.team.id), list=side.cands.filter(function(c){ return !ctx.outIds[c.id]; });
   list.sort(function(a,b){ return b.blend.ppg-a.blend.ppg; });
-  return list.slice(0,CFG.PLAYERS_PER_TEAM);
+  var core=list.slice(0,CFG.PLAYERS_PER_TEAM);
+  if(coreOnly||!CFG.DEPTH_PER_TEAM) return core;
+  var em=(S.espn&&S.espn.map)||{};
+  var ext=list.slice(CFG.PLAYERS_PER_TEAM,CFG.PLAYERS_PER_TEAM+CFG.DEPTH_PER_TEAM).filter(function(c){ return em[String(c.id)]||soLookup(c.name,side.team.abbr); });
+  ext.forEach(function(c){ c._depth=true; });
+  return core.concat(ext);
 }
 
 /* ====== matchup tilt from league defense table ====== */
@@ -630,7 +648,7 @@ function lineFor(gameId,name,teamAbbr,pid){
     return gs;
   }
   return {name:base.name||name,line:base.overLine,overLine:base.overLine,underLine:base.underLine,overOdds:base.overOdds,underOdds:base.underOdds,
-          overBook:base.overBook,underBook:base.underBook,book:base.overBook||base.underBook,src:ep?'espn':'so',est:!!(ep&&ep.est),
+          overBook:base.overBook,underBook:base.underBook,book:base.overBook||base.underBook,src:ep?'espn':'so',est:!!(ep&&ep.est),ladder:(ep&&ep.ladder)||null,
           news:gs?gs.news:'none',note:(gs&&gs.note)?gs.note:'',
           gsLine:(gs&&gs.line!==null&&gs.line!==undefined)?gs.line:null};
 }
@@ -652,6 +670,9 @@ function evaluatePlayer(c,side,game){
   if(prof.baseMin>=26&&spread!==null&&spread>=8){ minF*=Math.max(0.9,1-0.011*(spread-7)); flags.push('Blowout risk (spread '+fmt1(spread)+')'); blowout=true; if(spread>=12) caps.push({max:3,why:'blowout',side:'over'}); }
   var b2b=c.b2b; if(b2b&&prof.baseMin>=26){ minF*=0.965; flags.push('Back-to-back'); caps.push({max:3,why:'back-to-back',side:'over'}); }
 
+  var daysOff=null;
+  if(prof.lastCur){ daysOff=(Date.parse(S.date+'T12:00:00Z')-prof.lastT)/86400000; if(daysOff>=CFG.RETURN_DAYS){ minF*=daysOff>=21?0.88:0.93; flags.push('Returning after '+Math.round(daysOff)+' days'); caps.push({max:4,why:'returning from absence',side:'both'}); } }
+  if(c._depth) flags.push('Depth player (rank '+(CFG.PLAYERS_PER_TEAM+1)+'+)');
   var tctx=teamContext(side.team.id);
   var share=tctx.rotPts>0?c.blend.ppg/tctx.rotPts:0, mshare=tctx.rotMin>0?c.blend.min/tctx.rotMin:0;
   var usagePts=Math.min(3,0.20*tctx.outPts*share), minDelta=Math.min(3.5,0.35*tctx.outMin*mshare);
@@ -688,13 +709,33 @@ function evaluatePlayer(c,side,game){
   if(!li.book){ caps.push({max:3,why:'no book named',side:'both'}); flags.push('Book not named'); }
   var altSuspect=(oo!==null&&(oo<-140||oo>135))||(uo!==null&&(uo<-140||uo>135));
   if(altSuspect){ caps.push({max:3,why:'odds look like an alt line',side:'both'}); flags.push('Odds look off (alt line?)'); }
-  var gap=Math.abs(st.mean-line);
-  if(gap>Math.max(CFG.GAP_ABS,CFG.GAP_REL*line)){ res.held=true; res.gap=gap; return res; }
+  var gap=Math.abs(st.mean-line), soft=Math.max(CFG.GAP_ABS,CFG.GAP_REL*line), hard=Math.max(CFG.GAP_HARD_ABS,CFG.GAP_HARD_REL*line);
+  var hasNews=(news!=='none')||cls==='questionable'||cls==='doubtful';
+  if(gap>hard||(gap>soft&&hasNews)){ res.held=true; res.gap=gap; return res; }
+  if(gap>soft){ caps.push({max:3,why:'large model/line gap',side:'both'}); flags.push('Large model/line gap ('+fmt1(gap)+' pts)'); }
   if(li.est){ caps.push({max:3,why:'line estimated from ladder',side:'both'}); flags.push('Line estimated from ladder'); }
-  var best=pickBest(sim,oL,uL,oo,uo);
+  var known=(li.overOdds!==null&&li.overOdds!==undefined&&li.underOdds!==null&&li.underOdds!==undefined&&!li.est);
+  var best=pickBest(sim,oL,uL,oo,uo,known);
+  var mainNeed=CFG.MIN_EDGE+(li.est?CFG.EST_EXTRA_EDGE:0), alt=null;
+  if(CFG.ALT_LINES&&li.ladder&&!li.est){
+    li.ladder.forEach(function(rg){
+      if(Math.abs(rg.line-oL)<0.01||Math.abs(rg.line-oL)>CFG.ALT_RANGE) return;
+      var b=pickBest(sim,rg.line,rg.line,rg.o,rg.u,true);
+      if(!b||b.edge<mainNeed+CFG.ALT_EXTRA_EDGE) return;
+      if(!alt||b.ev>alt.ev) alt=b;
+    });
+    if(alt&&best&&best.edge>=mainNeed&&alt.ev<best.ev+CFG.ALT_EV_MARGIN) alt=null;
+  }
+  if(alt){
+    best=alt; res.alt=true; res.altOf=oL; res.overOdds=null; res.underOdds=null;
+    var rr=li.ladder.filter(function(g){ return g.line===alt.line; })[0]; if(rr){ res.overOdds=rr.o; res.underOdds=rr.u; }
+    flags.push('Alternate line (main line '+oL+')'); caps.push({max:4,why:'alternate line',side:'both'});
+  }
   if(!best) return res;
+  res.need=mainNeed+(alt?CFG.ALT_EXTRA_EDGE:0);
   res.best=best; res.line=best.line; res.book=best.side==='OVER'?(li.overBook||li.book||''):(li.underBook||li.book||'');
-  var base=best.edge>=10?5:best.edge>=7.5?4:best.edge>=CFG.MIN_EDGE+(li.est?CFG.EST_EXTRA_EDGE:0)?3:0;
+  var base=best.edge<res.need?0:best.edge>=CFG.STAR5_EDGE?5:best.edge>=CFG.STAR4_EDGE?4:3;
+  if(base===5&&Math.abs(st.mean-best.line)>3.5) base=4;              // 5 stars only when model and market roughly agree on the mean
   var sideKey=best.side.toLowerCase(), stars=base, capWhy=null;
   caps.forEach(function(cp){ if(cp.side==='both'||cp.side===sideKey){ if(cp.max<stars){ stars=cp.max; capWhy=cp.why; } } });
   res.stars=stars; res.capWhy=capWhy; res.baseStars=base;
@@ -703,7 +744,7 @@ function evaluatePlayer(c,side,game){
 
 function buildReason(r){
   var b=r.best, parts=[];
-  parts.push('Model '+fmt1(r.mean)+' pts (median '+r.median+', 10-90%: '+r.p10+'-'+r.p90+') on '+fmt1(r.projMin)+' min vs line '+r.line+'; P('+b.side.toLowerCase()+') '+pct0(b.win)+' vs '+pct0(impliedProb(b.odds))+' break-even.');
+  parts.push('Model '+fmt1(r.mean)+' pts (median '+r.median+', 10-90%: '+r.p10+'-'+r.p90+') on '+fmt1(r.projMin)+' min vs line '+r.line+'; P('+b.side.toLowerCase()+') model '+pct0(b.modelWin)+', market '+pct0(b.mktWin)+', blended '+pct0(b.win)+' vs '+pct0(impliedProb(b.odds))+' break-even.');
   var bits=[];
   if(r.usagePts>0.4) bits.push('usage +'+fmt1(r.usagePts)+' with teammate(s) out');
   if(r.tilt!==null&&Math.abs(r.tilt)>=0.2) bits.push('matchup '+signed(r.tilt)+' pts');
@@ -726,14 +767,14 @@ function computeAll(){
         if(r.excluded){ excluded.push(r); return; }
         analyzed++; all.push(r);
         if(r.li&&r.li.src==='espn') srcESPN++; else if(r.li&&r.li.src==='so') srcSO++; else if(r.li&&r.li.line!==null&&r.li.line!==undefined) srcGS++;
-        if(r.noLine) noLine.push(r); else if(r.held) held.push(r); else if(r.best&&r.stars>=3&&r.best.edge>=CFG.MIN_EDGE+((r.li&&r.li.est)?CFG.EST_EXTRA_EDGE:0)) flagged.push(r);
+        if(r.noLine) noLine.push(r); else if(r.held) held.push(r); else if(r.best&&r.stars>=3&&r.best.edge>=r.need) flagged.push(r);
       });
     });
   });
   flagged.sort(function(a,b){ return (b.stars-a.stars)||(b.best.edge-a.best.edge); });
   var kept=flagged.slice(0,CFG.MAX_FLAGS), dropped=flagged.slice(CFG.MAX_FLAGS);
   // volume rule: at most half of the flags at 4 stars or higher
-  var maxHigh=Math.max(1,Math.ceil(kept.length/2)), high=0;
+  var maxHigh=Math.max(1,Math.ceil(kept.length*CFG.MAX_HIGH_SHARE)), high=0;
   kept.forEach(function(r){ if(r.stars>=4){ high++; if(high>maxHigh){ r.stars=3; r.capWhy='volume rule'; } } });
   kept.sort(function(a,b){ return (b.stars-a.stars)||(b.best.edge-a.best.edge); });
   return {all:all,flagged:kept,extra:dropped.length,held:held,noLine:noLine,excluded:excluded,analyzed:analyzed,srcSO:srcSO,srcGS:srcGS,srcESPN:srcESPN};
@@ -754,7 +795,7 @@ function renderOutput(track){
   h+='<div class="sumline"><b>'+R.analyzed+'</b> players analyzed &middot; <b>'+R.flagged.length+'</b> flagged'+(R.extra?' (+'+R.extra+' more below the cap)':'')+' &middot; '+withLine+' with a posted line ('+R.srcESPN+' from ESPN, '+R.srcSO+' from props page, '+R.srcGS+' from search) &middot; '+R.noLine.length+' without a line (see action lines)';
   if(R.held.length) h+=' &middot; <b>'+R.held.length+'</b> held back (model and line disagree sharply, likely missed news: '+R.held.slice(0,4).map(function(r){ return escH(r.c.name); }).join(', ')+(R.held.length>4?'...':'')+')';
   if(R.excluded.length) h+=' &middot; '+R.excluded.length+' excluded (out/resting)';
-  h+='<br>Matchup data: '+(S.defense?'<b>'+escH(S.defense.season)+'</b> opponent shooting table':'<b>not available</b> (confidence capped at 4 stars)')+' &middot; ESPN props: '+escH(S.espnNote||'not loaded')+' &middot; Props page: '+escH(S.soNote||'not read')+' &middot; Min edge '+CFG.MIN_EDGE+'pp &middot; Max '+CFG.MAX_FLAGS+' flags &middot; Tracker imports '+CFG.TRACK_MIN_STARS+'+ stars</div>';
+  h+='<br>Matchup data: '+(S.defense?'<b>'+escH(S.defense.season)+'</b> opponent shooting table':'<b>not available</b> (confidence capped at 4 stars)')+' &middot; ESPN props: '+escH(S.espnNote||'not loaded')+' &middot; Props page: '+escH(S.soNote||'not read')+' &middot; Min blended edge '+CFG.MIN_EDGE+'pp (model '+Math.round(CFG.MODEL_WEIGHT*100)+'% / market '+Math.round((1-CFG.MODEL_WEIGHT)*100)+'%) &middot; No pick cap &middot; Tracker imports '+CFG.TRACK_MIN_STARS+'+ stars</div>';
 
   if(!R.flagged.length){
     h+='<div class="empty" style="min-height:200px;"><div class="empty-txt">No flagged edges right now.'+(withLine===0?'<br>No prop lines were found for this slate yet. Check the action lines below, or try Refresh Lines later.':'<br>That is normal - most nights have only a few real edges.')+'</div></div>';
@@ -783,7 +824,7 @@ function renderOutput(track){
         h+='<div class="rec" style="border-left-color:'+col+';">';
         h+='<div class="rec-top"><div class="rec-type" style="color:'+col+';">PTS PROP &mdash; '+escH(r.c.name)+' ('+escH(r.side.team.abbr)+')</div><div style="font-family:var(--mono);font-size:10px;color:'+col+';">'+starStr(r.stars)+' '+r.stars+'/5</div></div>';
         h+='<div class="rec-body"><b>'+b.side+' '+r.line+'</b> ('+fmtOdds(b.odds)+(r.book?', '+escH(r.book):'')+') &middot; proj '+fmt1(r.mean)+' (med '+r.median+') &middot; P('+b.side.toLowerCase()+') '+pct0(b.win)+' &middot; edge '+signed(b.edge)+'pp &middot; EV '+signed(b.ev,2)+'u</div>';
-        h+='<div class="rec-note">'+escH(buildReason(r))+(r.li&&r.li.note?' Note: '+escH(r.li.note):'')+(r.li&&r.li.src==='espn'?' '+((r.li.overBook||'DraftKings').replace(' (est.)',''))+' via ESPN'+(r.li.est?' (line estimated from the alternate ladder, prices assumed -110)':'')+': O '+fmtOdds(r.overOdds)+' / U '+fmtOdds(r.underOdds)+'.':'')+'</div>';
+        h+='<div class="rec-note">'+escH(buildReason(r))+(r.li&&r.li.note?' Note: '+escH(r.li.note):'')+(r.li&&r.li.src==='espn'?' '+((r.li.overBook||'DraftKings').replace(' (est.)',''))+' via ESPN'+(r.li.est?' (line estimated from the alternate ladder, prices assumed -110)':'')+(r.alt?' Alternate line (main line '+r.altOf+'), prices for this line':'')+': O '+fmtOdds(r.overOdds)+' / U '+fmtOdds(r.underOdds)+'.':'')+'</div>';
         var fl=r.flags.slice(); if(r.capWhy) fl.push('Capped: '+r.capWhy); if(r.oddsAssumed) fl.push('Odds assumed -110');
         if(fl.length){ h+='<div>'; fl.forEach(function(f){ h+='<span class="flag">'+escH(f)+'</span>'; }); h+='</div>'; }
         if(r.stars<CFG.TRACK_MIN_STARS) h+='<button class="mini-btn" onclick="trackPick('+r._idx+')">+ TRACK THIS PICK</button>';
@@ -841,7 +882,7 @@ function trackAction(i,side){
   var line=num(ans); if(line===null||line<1||line>60){ setStatus('Not tracked - that is not a valid line.',false); return; }
   var pr=simProbs(r.sim,line), den=pr.over+pr.under, win=den>0?(side==='OVER'?pr.over:pr.under)/den:0.5;
   var edge=(win-impliedProb(-110))*100;
-  if(edge<CFG.MIN_EDGE&&!confirm('That line is past the threshold (edge '+signed(edge)+'pp). Track it anyway?')) return;
+  if(edge<CFG.ACTION_EDGE&&!confirm('That line is past the threshold (edge '+signed(edge)+'pp). Track it anyway?')) return;
   var bets=loadBets();
   if(bets.some(function(b){ return b.date===S.date&&b.player===r.c.name&&b.side===side; })){ setStatus('Already in tracker.',false); return; }
   bets.push({id:Date.now()+Math.random(),date:S.date,game:gameLabel(r.game),player:r.c.name,team:r.side.team.abbr,side:side,line:line,
@@ -975,7 +1016,7 @@ function pickMainLines(items,bookName){
       var pr=by[a][L]; if(pr.length!==2) return;
       var po=CFG.ESPN_FIRST_IS_OVER?pr[0]:pr[1], pu=CFG.ESPN_FIRST_IS_OVER?pr[1]:pr[0];
       var io=impliedProb(po), iu=impliedProb(pu), skew=Math.abs(io-iu);
-      rows.push({line:parseFloat(L),dv:io/(io+iu)});
+      rows.push({line:parseFloat(L),dv:io/(io+iu),o:po,u:pu});
       if(!best||skew<best.skew) best={line:parseFloat(L),o:po,u:pu,skew:skew};
     });
     if(!best) return;
@@ -992,7 +1033,8 @@ function pickMainLines(items,bookName){
       if(!est) return;                              // ladder does not bracket 50%: do not guess
     }
     if(line<3||line>55) return;
-    out[a]={name:'',team:'',overLine:line,underLine:line,overOdds:o,underOdds:u,overBook:bk+(est?' (est.)':''),underBook:bk+(est?' (est.)':''),est:est};
+    out[a]={name:'',team:'',overLine:line,underLine:line,overOdds:o,underOdds:u,overBook:bk+(est?' (est.)':''),underBook:bk+(est?' (est.)':''),est:est,
+      ladder:rows.map(function(r){ return {line:r.line,o:r.o,u:r.u}; })};
   });
   return out;
 }
@@ -1003,7 +1045,7 @@ async function fetchProviders(g){
 }
 function gameGapIds(g){
   var em=(S.espn&&S.espn.map)||{}, ids=[], m=S.models[g.id]; if(!m) return ids;
-  m.sides.forEach(function(side){ selectTop(side).forEach(function(c){ if(!em[String(c.id)]) ids.push(String(c.id)); }); });
+  m.sides.forEach(function(side){ selectTop(side,true).forEach(function(c){ if(!em[String(c.id)]) ids.push(String(c.id)); }); });
   return ids;
 }
 async function fetchEspnProps(force){
@@ -1038,7 +1080,7 @@ async function fetchEspnProps(force){
 }
 function countGaps(){
   var gaps=0, em=(S.espn&&S.espn.map)||{};
-  Object.keys(S.models).forEach(function(gid){ S.models[gid].sides.forEach(function(side){ selectTop(side).forEach(function(c){ if(!em[String(c.id)]) gaps++; }); }); });
+  Object.keys(S.models).forEach(function(gid){ S.models[gid].sides.forEach(function(side){ selectTop(side,true).forEach(function(c){ if(!em[String(c.id)]) gaps++; }); }); });
   return gaps;
 }
 
@@ -1262,7 +1304,7 @@ function buildChunks(){
   Object.keys(S.models).forEach(function(gid){
     var gm=S.models[gid], players=[];
     gm.sides.forEach(function(side){
-      selectTop(side).forEach(function(c){
+      selectTop(side,true).forEach(function(c){
         if(!CFG.SEARCH_ALL_FOR_NEWS){ var li0=lineFor(gm.game.id,c.name,side.team.abbr,c.id); if(li0&&li0.line!==null&&li0.line!==undefined) return; }
         var inj=S.injuries.byId[c.id];
         players.push({id:c.id,name:c.name,team:side.team.abbr,status:inj?inj.status+(inj.comment?' - '+inj.comment.slice(0,60):''):'Active'});
@@ -1308,7 +1350,7 @@ async function runSecondPass(force){
   Object.keys(S.models).forEach(function(gid){
     var gm=S.models[gid], players=[];
     gm.sides.forEach(function(side){
-      selectTop(side).forEach(function(c){
+      selectTop(side,true).forEach(function(c){
         var li=lineFor(gm.game.id,c.name,side.team.abbr,c.id);
         if(li&&(li.news==='out'||li.news==='doubtful'||li.news==='resting')) return;
         if(li&&li.line!==null&&li.line!==undefined) return;
@@ -1465,7 +1507,7 @@ function importPicks(list,manual){
     var dup=bets.some(function(b){ return b.date===S.date&&b.player===r.c.name&&b.side===r.best.side; });
     if(dup) return;
     bets.push({id:Date.now()+Math.random(),date:S.date,game:gameLabel(r.game),player:r.c.name,team:r.side.team.abbr,side:r.best.side,line:r.line,
-               odds:r.best.odds,book:r.book||'',src:'line',pick:r.best.side+' '+r.line+' PTS',conf:r.stars,proj:Math.round(r.mean*10)/10,median:r.median,edge:Math.round(r.best.edge*10)/10,result:'P'});
+               odds:r.best.odds,book:r.book||'',src:'line',alt:!!r.alt,pick:r.best.side+' '+r.line+' PTS'+(r.alt?' (alt)':''),conf:r.stars,proj:Math.round(r.mean*10)/10,median:r.median,edge:Math.round(r.best.edge*10)/10,result:'P'});
     added++;
   });
   saveBets(bets); updateTrackerBadge(); return added;
@@ -1544,7 +1586,7 @@ function renderPerfGrid(bets){
 (function init(){
   var k=lsGet('hbs_key',null); if(k){ $('apiKey').value=k; }
   onKeyInput(); updateTrackerBadge();
-  $('rulesBox').innerHTML='Min edge: '+CFG.MIN_EDGE+' pp<br>Max flags: '+CFG.MAX_FLAGS+'<br>Players per team: top '+CFG.PLAYERS_PER_TEAM+'<br>Tracked at: '+CFG.TRACK_MIN_STARS+'+ stars<br>Early-season cap: 3 stars under '+CFG.EARLY_GP+' games<br>Matchup tilt cap: &plusmn;'+Math.round(CFG.TILT_CAP*100)+'%<br>Lines: ESPN (DraftKings, then other ESPN books, then ladder estimate), then props page, then search, then action lines<br>Gemini calls per run: none if ESPN covers everyone; otherwise only for the gaps';
+  $('rulesBox').innerHTML='Min edge: '+CFG.MIN_EDGE+' pp after blending ('+Math.round(CFG.MODEL_WEIGHT*100)+'% model / '+Math.round((1-CFG.MODEL_WEIGHT)*100)+'% market)<br>Pick cap: none<br>Players per team: top '+CFG.PLAYERS_PER_TEAM+' plus '+CFG.DEPTH_PER_TEAM+' depth players when a line is posted<br>Alternate lines: considered from ESPN ladder<br><br>Tracked at: '+CFG.TRACK_MIN_STARS+'+ stars<br>Early-season cap: 3 stars under '+CFG.EARLY_GP+' games<br>Matchup tilt cap: &plusmn;'+Math.round(CFG.TILT_CAP*100)+'%<br>Lines: ESPN (DraftKings, then other ESPN books, then ladder estimate), then props page, then search, then action lines<br>Gemini calls per run: none if ESPN covers everyone; otherwise only for the gaps';
 })();
 </script>
 </body>
